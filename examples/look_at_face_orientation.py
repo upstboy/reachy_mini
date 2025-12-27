@@ -1,4 +1,18 @@
-"""Teleop Reachy Mini head with laptop face tracking (nose + orientation)."""
+"""Teleop Reachy Mini head with laptop face tracking (orientation only).
+
+How it works (quick map for beginners):
+1) A laptop webcam sees your face and MediaPipe finds face landmarks.
+2) A small set of landmarks goes into solvePnP to estimate head pose (yaw/pitch/roll).
+3) Press "s" to capture a neutral baseline so your natural head position becomes zero.
+4) Each update, we apply gains, clamp angles, and smooth the motion to reduce jitter.
+5) The robot head pose is sent directly, and a cube overlay shows the tracked pose.
+
+Controls & tips:
+- Keys: s=start calibration, p=pause, r=reset, d=toggle debug, q=quit.
+- If motion feels reversed, try --mirror-pitch or --mirror-yaw.
+- If the preview feels odd, try --no-flip-webcam.
+- Increase --update-hz for snappier motion or lower it for stability.
+"""
 
 import argparse
 import math
@@ -608,6 +622,10 @@ def main(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
+    # Troubleshooting tips:
+    # - Looking up/down feels reversed? Try --mirror-pitch (or --mirror-yaw).
+    # - Motion is jittery? Increase --smoothing or lower --max-step-deg.
+    # - No landmarks? Ensure good lighting and the model is downloaded in .models/.
     parser = argparse.ArgumentParser(
         description="Use laptop face tracking to drive Reachy Mini's head target."
     )
