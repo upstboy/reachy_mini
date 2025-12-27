@@ -197,6 +197,7 @@ cython_debug/
 .idea/**/uiDesigner.xml
 .idea/**/dbnavigator.xml
 .idea/**/contentModel.xml
+.models/
 
 # Abstra
 #   Abstra is an AI-powered process automation framework.
