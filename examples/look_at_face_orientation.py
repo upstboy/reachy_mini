@@ -48,6 +48,7 @@ MODEL_URL = (
 MODEL_DIR = Path(__file__).resolve().parent / ".models"
 MODEL_PATH = MODEL_DIR / "face_landmarker.task"
 
+# Key face points used to solve a simple 3D head pose.
 LANDMARK_IDXS = {
     "nose_tip": 1,
     "chin": 152,
@@ -136,6 +137,7 @@ class FaceTracker:
         if MODEL_PATH.exists():
             return str(MODEL_PATH)
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        # The model is cached locally so it only downloads once.
         print("Downloading face landmarker model...")
         try:
             urlretrieve(MODEL_URL, MODEL_PATH)
@@ -150,6 +152,7 @@ class FaceTracker:
     def _solve_head_pose(
         self, landmarks: list, w: int, h: int
     ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        # Pick a few stable 2D points, then solve the 3D head pose with PnP.
         image_points = np.array(
             [
                 self._landmark_to_point(landmarks[LANDMARK_IDXS["nose_tip"]], w, h),
@@ -170,6 +173,7 @@ class FaceTracker:
         )
         dist_coeffs = np.zeros((4, 1), dtype=np.float32)
 
+        # rvec/tvec describe the 3D pose of the head relative to the camera.
         success, rvec, tvec = cv2.solvePnP(
             MODEL_POINTS,
             image_points,
@@ -185,6 +189,7 @@ class FaceTracker:
         if self.landmarker is None:
             return None
 
+        # Convert to MediaPipe's expected input format.
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self.landmarker.detect(mp_image)
@@ -194,8 +199,10 @@ class FaceTracker:
         landmarks = result.face_landmarks[0]
         h, w = frame.shape[:2]
 
+        # Store the nose point in normalized coordinates for quick debug drawing.
         nx = float(np.clip(landmarks[LANDMARK_IDXS["nose_tip"]].x, 0.0, 1.0))
         ny = float(np.clip(landmarks[LANDMARK_IDXS["nose_tip"]].y, 0.0, 1.0))
+        # Simple 2D face box for drawing a preview marker.
         xs = [lm.x for lm in landmarks]
         ys = [lm.y for lm in landmarks]
         x1 = int(np.clip(min(xs) * w, 0, w - 1))
@@ -204,10 +211,12 @@ class FaceTracker:
         y2 = int(np.clip(max(ys) * h, 0, h - 1))
         bbox = (x1, y1, x2, y2)
 
+        # Estimate head pose from a few stable landmarks using solvePnP.
         pose = self._solve_head_pose(landmarks, w, h)
         if pose is None:
             return None
         rvec, tvec, camera_matrix, dist_coeffs = pose
+        # Convert rotation vector to Euler angles (yaw/pitch/roll).
         rmat, _ = cv2.Rodrigues(rvec)
         yaw, pitch, roll = rotation_matrix_to_euler(rmat)
         return FaceResult(
@@ -225,32 +234,6 @@ class FaceTracker:
         )
 
 
-def compensate_aspect(
-    nx: float, ny: float, laptop_size: Tuple[int, int], reachy_size: Tuple[int, int]
-) -> Tuple[float, float]:
-    lw, lh = laptop_size
-    rw, rh = reachy_size
-    if lw == 0 or lh == 0 or rw == 0 or rh == 0:
-        return nx, ny
-
-    laptop_aspect = lw / lh
-    reachy_aspect = rw / rh
-
-    if abs(laptop_aspect - reachy_aspect) < 1e-3:
-        return nx, ny
-
-    if laptop_aspect > reachy_aspect:
-        crop = reachy_aspect / laptop_aspect
-        x0 = (1.0 - crop) * 0.5
-        nx = (nx - x0) / crop
-    else:
-        crop = laptop_aspect / reachy_aspect
-        y0 = (1.0 - crop) * 0.5
-        ny = (ny - y0) / crop
-
-    return float(np.clip(nx, 0.0, 1.0)), float(np.clip(ny, 0.0, 1.0))
-
-
 def draw_marker(frame: np.ndarray, x: int, y: int, active: bool) -> None:
     color = (0, 200, 0) if active else (0, 0, 200)
     cv2.drawMarker(frame, (x, y), color, markerType=cv2.MARKER_CROSS, markerSize=18, thickness=2)
@@ -265,6 +248,7 @@ def draw_head_cube(
 ) -> None:
     if rvec is None or tvec is None or camera_matrix is None or dist_coeffs is None:
         return
+    # Project a 3D cube into the 2D image using the head pose.
     size = 120.0
     half = size / 2.0
     cube_points = np.array(
@@ -332,36 +316,22 @@ def overlay_preview(base: np.ndarray, preview: np.ndarray, scale: float, margin:
     base[y1:y2, x1:x2] = resized[: y2 - y1, : x2 - x1]
 
 
-def compute_target(
-    face: FaceResult,
-    baseline: FaceResult,
-    pos_gain_x: float,
-    pos_gain_y: float,
-    orient_gain_x: float,
-    orient_gain_y: float,
-) -> Tuple[float, float]:
-    dx = face.nx - baseline.nx
-    dy = face.ny - baseline.ny
-    dyaw = face.yaw - baseline.yaw
-    dpitch = face.pitch - baseline.pitch
-    tx = 0.5 + dx * pos_gain_x + dyaw * orient_gain_x
-    ty = 0.5 + dy * pos_gain_y - dpitch * orient_gain_y
-    return float(np.clip(tx, 0.0, 1.0)), float(np.clip(ty, 0.0, 1.0))
-
-
 def clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
 
 
 def ema_value(prev: float, current: float, alpha: float) -> float:
+    # Simple exponential smoothing to reduce jitter.
     return (1.0 - alpha) * prev + alpha * current
 
 
 def ema_vec(prev: np.ndarray, current: np.ndarray, alpha: float) -> np.ndarray:
+    # Vector version of EMA used for rvec/tvec smoothing.
     return (1.0 - alpha) * prev + alpha * current
 
 
 def clamp_step(prev: float, current: float, max_step: float) -> float:
+    # Limit how fast the target can change per update.
     return prev + clamp(current - prev, -max_step, max_step)
 
 
@@ -382,8 +352,6 @@ def main(args: argparse.Namespace) -> None:
 
     last_command = 0.0
     last_active_time = 0.0
-    last_target_px: Optional[Tuple[int, int]] = None
-    last_filtered: Optional[Tuple[float, float]] = None
     last_filtered_rpy: Optional[Tuple[float, float, float]] = None
     last_pose_rvec: Optional[np.ndarray] = None
     last_pose_tvec: Optional[np.ndarray] = None
@@ -396,6 +364,7 @@ def main(args: argparse.Namespace) -> None:
         try:
             reachy_mini.goto_target(INIT_HEAD_POSE, antennas=[0.0, 0.0], duration=1.0)
             while True:
+                # Grab frames from both cameras.
                 reachy_frame = reachy_mini.media.get_frame()
                 laptop_frame = laptop.read()
 
@@ -411,6 +380,7 @@ def main(args: argparse.Namespace) -> None:
                 if args.flip_webcam:
                     laptop_frame = cv2.flip(laptop_frame, 1)
 
+                # Detect head pose in the laptop webcam.
                 face = tracker.estimate(laptop_frame)
                 now = time.monotonic()
                 face_active = face is not None
@@ -418,18 +388,18 @@ def main(args: argparse.Namespace) -> None:
                     last_active_time = now
                     neutral_sent = False
 
+                # Start tracking on the next frame (after pressing "s").
                 if control_state["request_start"]:
                     control_state["enabled"] = True
                     control_state["request_start"] = False
                     baseline = None
                     baseline_samples.clear()
                     baseline_started = None
-                    last_filtered = None
-                    last_target_px = None
                     last_filtered_rpy = None
                     last_pose_rvec = None
                     last_pose_tvec = None
 
+                # Collect a short neutral baseline to define "zero" head pose.
                 if control_state["enabled"] and baseline is None and face_active:
                     if baseline_started is None:
                         baseline_started = now
@@ -453,110 +423,65 @@ def main(args: argparse.Namespace) -> None:
                             dist_coeffs=None,
                         )
 
+                # Compute and send a new target at a fixed update rate.
                 if (
                     control_state["enabled"]
                     and baseline is not None
                     and face_active
                     and (now - last_command) >= 1.0 / max(1.0, args.update_hz)
                 ):
-                    if args.control_mode == "orientation":
-                        dyaw = face.yaw - baseline.yaw
-                        dpitch = face.pitch - baseline.pitch
-                        droll = face.roll - baseline.roll
-                        if args.mirror_yaw:
-                            dyaw = -dyaw
-                        if args.mirror_pitch:
-                            dpitch = -dpitch
-                        if args.mirror_roll:
-                            droll = -droll
+                    # Direct mode: map operator yaw/pitch/roll to robot head angles.
+                    dyaw = face.yaw - baseline.yaw
+                    dpitch = face.pitch - baseline.pitch
+                    droll = face.roll - baseline.roll
+                    if args.mirror_yaw:
+                        dyaw = -dyaw
+                    if args.mirror_pitch:
+                        dpitch = -dpitch
+                    if args.mirror_roll:
+                        droll = -droll
 
-                        tyaw = dyaw * args.orientation_gain_yaw
-                        tpitch = dpitch * args.orientation_gain_pitch
-                        troll = droll * args.orientation_gain_roll
+                    tyaw = dyaw * args.orientation_gain_yaw
+                    tpitch = dpitch * args.orientation_gain_pitch
+                    troll = droll * args.orientation_gain_roll
 
-                        max_yaw = math.radians(args.max_yaw_deg)
-                        max_pitch = math.radians(args.max_pitch_deg)
-                        max_roll = math.radians(args.max_roll_deg)
-                        tyaw = clamp(tyaw, -max_yaw, max_yaw)
-                        tpitch = clamp(tpitch, -max_pitch, max_pitch)
-                        troll = clamp(troll, -max_roll, max_roll)
+                    max_yaw = math.radians(args.max_yaw_deg)
+                    max_pitch = math.radians(args.max_pitch_deg)
+                    max_roll = math.radians(args.max_roll_deg)
+                    tyaw = clamp(tyaw, -max_yaw, max_yaw)
+                    tpitch = clamp(tpitch, -max_pitch, max_pitch)
+                    troll = clamp(troll, -max_roll, max_roll)
 
-                        if last_filtered_rpy is not None and args.max_step_deg > 0.0:
-                            max_step = math.radians(args.max_step_deg)
-                            tyaw = clamp_step(last_filtered_rpy[0], tyaw, max_step)
-                            tpitch = clamp_step(last_filtered_rpy[1], tpitch, max_step)
-                            troll = clamp_step(last_filtered_rpy[2], troll, max_step)
+                    if last_filtered_rpy is not None and args.max_step_deg > 0.0:
+                        max_step = math.radians(args.max_step_deg)
+                        tyaw = clamp_step(last_filtered_rpy[0], tyaw, max_step)
+                        tpitch = clamp_step(last_filtered_rpy[1], tpitch, max_step)
+                        troll = clamp_step(last_filtered_rpy[2], troll, max_step)
 
-                        if last_filtered_rpy is None or args.smoothing <= 0.0:
-                            fyaw, fpitch, froll = tyaw, tpitch, troll
-                        else:
-                            fyaw = ema_value(last_filtered_rpy[0], tyaw, args.smoothing)
-                            fpitch = ema_value(last_filtered_rpy[1], tpitch, args.smoothing)
-                            froll = ema_value(last_filtered_rpy[2], troll, args.smoothing)
-                        last_filtered_rpy = (fyaw, fpitch, froll)
-
-                        head_pose = create_head_pose(
-                            roll=froll,
-                            pitch=fpitch,
-                            yaw=fyaw,
-                            degrees=False,
-                            mm=False,
-                        )
-                        reachy_mini.set_target(head=head_pose)
-                        last_command = now
+                    # Smooth the motion to avoid jitter.
+                    if last_filtered_rpy is None or args.smoothing <= 0.0:
+                        fyaw, fpitch, froll = tyaw, tpitch, troll
                     else:
-                        tx, ty = compute_target(
-                            face=face,
-                            baseline=baseline,
-                            pos_gain_x=args.position_gain_x,
-                            pos_gain_y=args.position_gain_y,
-                            orient_gain_x=args.orientation_gain_x,
-                            orient_gain_y=args.orientation_gain_y,
-                        )
+                        fyaw = ema_value(last_filtered_rpy[0], tyaw, args.smoothing)
+                        fpitch = ema_value(last_filtered_rpy[1], tpitch, args.smoothing)
+                        froll = ema_value(last_filtered_rpy[2], troll, args.smoothing)
+                    last_filtered_rpy = (fyaw, fpitch, froll)
 
-                        if args.aspect_compensate:
-                            tx, ty = compensate_aspect(
-                                tx,
-                                ty,
-                                laptop_size=(laptop_frame.shape[1], laptop_frame.shape[0]),
-                                reachy_size=(reachy_frame.shape[1], reachy_frame.shape[0]),
-                            )
-
-                        if last_filtered is None or args.smoothing <= 0.0:
-                            fx, fy = tx, ty
-                        else:
-                            fx = (1.0 - args.smoothing) * last_filtered[0] + args.smoothing * tx
-                            fy = (1.0 - args.smoothing) * last_filtered[1] + args.smoothing * ty
-                        last_filtered = (fx, fy)
-
-                        rx, ry = reachy_frame.shape[1], reachy_frame.shape[0]
-                        target_x = int(np.clip(fx * rx, 1, max(1, rx - 1)))
-                        target_y = int(np.clip(fy * ry, 1, max(1, ry - 1)))
-
-                        if last_target_px is not None and args.deadzone_px > 0:
-                            dx = target_x - last_target_px[0]
-                            dy = target_y - last_target_px[1]
-                            if (dx * dx + dy * dy) ** 0.5 < args.deadzone_px:
-                                target_x = last_target_px[0]
-                                target_y = last_target_px[1]
-
-                        if last_target_px is None or (target_x, target_y) != last_target_px:
-                            target_pose = reachy_mini.look_at_image(
-                                target_x,
-                                target_y,
-                                duration=0.0,
-                                perform_movement=False,
-                            )
-                            reachy_mini.set_target(head=target_pose)
-                            last_command = now
-                            last_target_px = (target_x, target_y)
+                    # Send the head pose directly.
+                    head_pose = create_head_pose(
+                        roll=froll,
+                        pitch=fpitch,
+                        yaw=fyaw,
+                        degrees=False,
+                        mm=False,
+                    )
+                    reachy_mini.set_target(head=head_pose)
+                    last_command = now
 
                 display_reachy = reachy_frame.copy()
                 display_laptop = laptop_frame.copy()
 
-                if last_target_px is not None:
-                    draw_marker(display_reachy, last_target_px[0], last_target_px[1], True)
-
+                # Draw target markers and pose cube for the operator.
                 if face is not None:
                     gx = int(face.nx * display_laptop.shape[1])
                     gy = int(face.ny * display_laptop.shape[0])
@@ -596,14 +521,10 @@ def main(args: argparse.Namespace) -> None:
                         2,
                     )
                     if baseline is not None and face is not None:
-                        if args.control_mode == "orientation" and last_filtered_rpy is not None:
+                        if last_filtered_rpy is not None:
                             yaw_deg = math.degrees(last_filtered_rpy[0])
                             pitch_deg = math.degrees(last_filtered_rpy[1])
                             roll_deg = math.degrees(last_filtered_rpy[2])
-                        else:
-                            yaw_deg = math.degrees(face.yaw - baseline.yaw)
-                            pitch_deg = math.degrees(face.pitch - baseline.pitch)
-                            roll_deg = math.degrees(face.roll - baseline.roll)
                         cv2.putText(
                             display_reachy,
                             f"Head RPY (deg): {roll_deg:+.1f}  {pitch_deg:+.1f}  {yaw_deg:+.1f}",
@@ -631,6 +552,7 @@ def main(args: argparse.Namespace) -> None:
                 )
                 cv2.imshow("Reachy Mini Face Teleop", display_reachy)
 
+                # Handle keyboard input for quick control.
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
@@ -639,16 +561,16 @@ def main(args: argparse.Namespace) -> None:
                 if key == ord("s"):
                     control_state["request_start"] = True
                 if key == ord("p"):
+                    # Pause tracking and clear the baseline.
                     control_state["enabled"] = False
                     baseline = None
                     baseline_samples.clear()
                     baseline_started = None
-                    last_target_px = None
-                    last_filtered = None
                     last_filtered_rpy = None
                     last_pose_rvec = None
                     last_pose_tvec = None
                 if key == ord("r"):
+                    # Reset the robot to its neutral pose.
                     reachy_mini.goto_target(
                         INIT_HEAD_POSE,
                         antennas=[0.0, 0.0],
@@ -657,13 +579,12 @@ def main(args: argparse.Namespace) -> None:
                     baseline = None
                     baseline_samples.clear()
                     baseline_started = None
-                    last_target_px = None
-                    last_filtered = None
                     last_filtered_rpy = None
                     last_pose_rvec = None
                     last_pose_tvec = None
                     neutral_sent = False
 
+                # If the face is lost for too long, return to neutral.
                 if not face_active and (now - last_active_time) > args.lost_timeout:
                     if control_state["enabled"] and not neutral_sent:
                         reachy_mini.goto_target(
@@ -674,8 +595,6 @@ def main(args: argparse.Namespace) -> None:
                         baseline = None
                         baseline_samples.clear()
                         baseline_started = None
-                        last_target_px = None
-                        last_filtered = None
                         last_filtered_rpy = None
                         last_pose_rvec = None
                         last_pose_tvec = None
@@ -709,13 +628,6 @@ if __name__ == "__main__":
         help="Minimum detection/tracking confidence for face landmarks.",
     )
     parser.add_argument(
-        "--control-mode",
-        type=str,
-        choices=["orientation", "gaze"],
-        default="orientation",
-        help="Control mode: direct head orientation or gaze target.",
-    )
-    parser.add_argument(
         "--update-hz",
         type=float,
         default=15.0,
@@ -732,36 +644,6 @@ if __name__ == "__main__":
         type=float,
         default=6.0,
         help="Max per-update change in degrees for direct head control.",
-    )
-    parser.add_argument(
-        "--deadzone-px",
-        type=float,
-        default=8.0,
-        help="Ignore tiny target updates under this pixel distance.",
-    )
-    parser.add_argument(
-        "--position-gain-x",
-        type=float,
-        default=2.0,
-        help="Scale nose horizontal movement.",
-    )
-    parser.add_argument(
-        "--position-gain-y",
-        type=float,
-        default=2.0,
-        help="Scale nose vertical movement.",
-    )
-    parser.add_argument(
-        "--orientation-gain-x",
-        type=float,
-        default=0.8,
-        help="Scale head yaw (radians) into horizontal offset.",
-    )
-    parser.add_argument(
-        "--orientation-gain-y",
-        type=float,
-        default=0.8,
-        help="Scale head pitch (radians) into vertical offset.",
     )
     parser.add_argument(
         "--orientation-gain-yaw",
